@@ -1,0 +1,29 @@
+{
+  "name": "app",
+  "version": "1.0.0",
+  "private": true,
+  "description": "AI 學習平台前端 (Vue 2)",
+  "scripts": {
+    "serve": "vue-cli-service serve",
+    "build": "vue-cli-service build",
+    "lint": "vue-cli-service lint",
+    "clean": "rimraf node_modules dist"
+  },
+  "dependencies": {
+    "core-js": "^3.37.1",
+    "vue": "^2.7.16",
+    "axios": "^1.7.2"
+  },
+  "devDependencies": {
+    "@vue/cli-plugin-babel": "~5.0.0",
+    "@vue/cli-plugin-eslint": "~5.0.0",
+    "@vue/cli-service": "~5.0.0",
+    "babel-eslint": "^10.1.0",
+    "eslint": "^7.32.0",
+    "eslint-plugin-vue": "^8.7.1",
+    "vue-template-compiler": "^2.7.16",
+    "rimraf": "^5.0.5"
+  },
+  "browserslist": ["> 1%","last 2 versions","not dead"],
+  "engines": { "node": ">=16.0.0" }
+}

@@ -111,53 +111,36 @@ async function parseFile(filePath, mimeType) {
 // 提取關鍵知識點
 async function extractKeyPoints(content) {
   try {
-    const response = await ai.models.generateContent({
-      model: process.env.GEMINI_MODEL || 'gemini-2.5-flash-lite',
-      contents: [
-        `請分析以下教材內容，提取關鍵知識點：
-        
-        教材內容：
-        ${content}
-        
-        請以結構化的JSON格式返回，包含：
-        1. 主要主題 (topics)
-        2. 重要概念 (concepts) 
-        3. 關鍵事實 (facts)
-        4. 教材摘要 (summary)`
-      ],
-      config: {
-        responseMimeType: "application/json",
-        responseSchema: {
-          type: Type.OBJECT,
-          properties: {
-            topics: {
-              type: Type.ARRAY,
-              items: { type: Type.STRING }
-            },
-            concepts: {
-              type: Type.ARRAY,
-              items: { 
-                type: Type.OBJECT,
-                properties: {
-                  name: { type: Type.STRING },
-                  description: { type: Type.STRING }
-                }
-              }
-            },
-            facts: {
-              type: Type.ARRAY,
-              items: { type: Type.STRING }
-            },
-            summary: { type: Type.STRING }
-          }
-        },
-        thinkingConfig: {
-          thinkingBudget: 0
+    const attempt = async () => {
+      const response = await ai.models.generateContent({
+        model: process.env.GEMINI_MODEL || 'gemini-2.5-flash-lite',
+        contents: [
+          `請分析以下教材內容，提取關鍵知識點：\n\n教材內容：\n${content}\n\n請以結構化的JSON格式返回，包含：\n1. 主要主題 (topics)\n2. 重要概念 (concepts) \n3. 關鍵事實 (facts)\n4. 教材摘要 (summary)`
+        ],
+        config: {
+          responseMimeType: "application/json",
+          responseSchema: { type: Type.OBJECT, properties: { topics:{ type:Type.ARRAY, items:{ type:Type.STRING } }, concepts:{ type:Type.ARRAY, items:{ type:Type.OBJECT, properties:{ name:{ type:Type.STRING }, description:{ type:Type.STRING } } } }, facts:{ type:Type.ARRAY, items:{ type:Type.STRING } }, summary:{ type:Type.STRING } } },
+          thinkingConfig: { thinkingBudget: 0 }
         }
-      }
-    });
+      });
+      return JSON.parse(response.text);
+    };
 
-    return JSON.parse(response.text);
+    const maxRetries = 2;
+    let lastErr;
+    for (let i=0;i<=maxRetries;i++) {
+      try { return await attempt(); } catch(e){
+        lastErr = e;
+        if (!/UNAVAILABLE|503|timeout|unavailable/i.test(e.message) || i===maxRetries) break;
+        const delay = 500 * Math.pow(2,i) + Math.random()*300;
+        await new Promise(r=>setTimeout(r, delay));
+      }
+    }
+    // fallback 簡易抽取：取前 3 行當主題，分句取 facts
+    const lines = content.split(/\n+/).map(l=>l.trim()).filter(Boolean);
+    const firstBlock = lines.slice(0,3);
+    const facts = content.split(/[。.!?\n]/).map(s=>s.trim()).filter(s=>s.length>8).slice(0,8);
+    return { topics: firstBlock.slice(0,3), concepts: [], facts, summary: lines.join(' ').slice(0,400) };
   } catch (error) {
     throw new Error(`知識點提取失败: ${error.message}`);
   }
@@ -166,178 +149,220 @@ async function extractKeyPoints(content) {
 // 生成題目
 async function generateQuestions(content, keyPoints, difficulty = 'medium', totalCount = 10, distribution = null) {
   try {
-    const difficultyPrompts = {
-      easy: '生成簡單的基礎題目，適合初學者',
-      medium: '生成中等難度題目，需要理解和應用',
-      hard: '生成困難題目，需要深度分析和綜合運用'
-    };
-
-    // 預設題型分配
-    const defaultDistribution = {
-      multipleChoice: 40,
-      trueFalse: 30,
-      shortAnswer: 30
-    };
-
+    const difficultyPrompts = { easy:'生成簡單的基礎題目，適合初學者', medium:'生成中等難度題目，需要理解和應用', hard:'生成困難題目，需要深度分析和綜合運用' };
+    const defaultDistribution = { multipleChoice:40, trueFalse:30, shortAnswer:30 };
     const dist = distribution || defaultDistribution;
-    
-    // 計算各題型數量
     const counts = {
       multiple: Math.round(totalCount * dist.multipleChoice / 100),
       trueFalse: Math.round(totalCount * dist.trueFalse / 100),
       shortAnswer: Math.round(totalCount * dist.shortAnswer / 100)
     };
-
-    // 確保總數量正確
     const actualTotal = counts.multiple + counts.trueFalse + counts.shortAnswer;
-    if (actualTotal !== totalCount) {
-      const diff = totalCount - actualTotal;
-      counts.multiple += diff; // 將差值加到多選題上
+    if (actualTotal !== totalCount) counts.multiple += (totalCount - actualTotal);
+
+    // 更精準的佔位/低品質樣式集合：避免把正常解析句子誤判
+    const placeholderPattern = new RegExp([
+      '^干擾選項$',
+      '干擾選項[一二三123]',
+      '與教材不符(?:的說法)?',
+      '^正確敘述$',
+      '^選項[ABCD]$',
+      '誤解[一二三1-3]',
+      '自動補全',
+      '概念不明',
+      '隨意',
+      '假設性敘述'
+    ].join('|'), 'i');
+
+    const isPlaceholder = (txt) => {
+      if (!txt) return false;
+      const t = String(txt).trim();
+      if (!t) return false;
+      // 短且僅有模板詞的才視為佔位；長句子僅含「正確敘述為…」不算
+      if (t.length <= 20 && placeholderPattern.test(t)) return true;
+      // 明顯的集合詞且無標點
+      if (/干擾選項|自動補全|概念不明|假設性敘述/.test(t) && t.length < 40 && !/[。.!?；;]$/.test(t)) return true;
+      return false;
+    };
+
+    const baseInstruction = `【題目品質規範 – 必須遵守】\nA. 嚴禁出現純佔位或模板字樣（如：干擾選項一 / 與教材不符 / 選項A 等單獨字樣）。\nB. 多選題 4 個選項：1 正確 + 3 具迷惑性但具體且明確錯誤或常見誤解；錯誤選項需與正確選項共享部分語境。\nC. 題幹多樣化（情境 / 反例 / 判斷 / 應用 / 排除），避免統一句型。\nD. explanation 必須：先闡述正確答案核心理由，再依序簡短說明 B/C/D 錯誤點（格式：B：…；C：…；D：…）。\nE. trueFalse 題：必須是可驗證陳述；避免『此敘述是否正確』式結尾。\nF. 簡答題：要求分析/比較/應用/舉例；答案 50~120 字，避免只列名詞。\nG. 僅輸出 JSON，無其他自然語言。`;
+
+    const safeParseJSON = (text) => {
+      if (!text) return null;
+      let raw = text;
+      try { return JSON.parse(raw); } catch(e) {}
+      try {
+        raw = raw.replace(/```json|```/gi,'').trim();
+        // 取第一個 '{' 到最後一個 '}'
+        const first = raw.indexOf('{');
+        const last = raw.lastIndexOf('}');
+        if (first !== -1 && last !== -1 && last > first) {
+          const slice = raw.slice(first, last + 1);
+          return JSON.parse(slice);
+        }
+      } catch(e) {}
+      // 嘗試匹配 questions 陣列
+      try {
+        const match = raw.match(/"questions"\s*:\s*\[(.|\n|\r)*?\]/);
+        if (match) {
+          const obj = '{' + match[0] + '}';
+          return JSON.parse(obj);
+        }
+      } catch(e) {}
+      return null;
+    };
+
+    const attempt = async (refineContext = null) => {
+      const refineNote = refineContext ? `\n【再生成修正原因】先前出現疑似模板/格式問題：${refineContext.slice(0,200)}。請重新完整生成，不得出現相同句子。` : '';
+      const prompt = `基於下列教材內容與關鍵點，${difficultyPrompts[difficulty]} 產出共 ${totalCount} 題（多選 ${counts.multiple} / 真偽 ${counts.trueFalse} / 簡答 ${counts.shortAnswer}）：\n${refineNote}\n--- 教材內容 ---\n${content}\n--- keyPoints ---\n${JSON.stringify(keyPoints, null, 2)}\n${baseInstruction}\n輸出格式：{"questions":[{id,type,question,options?,answer,explanation,relatedConcepts[]}]} (合法 JSON)。`;
+      const response = await ai.models.generateContent({
+        model: process.env.GEMINI_MODEL || 'gemini-2.5-flash-lite',
+        contents: [ prompt ],
+        config: {
+          responseMimeType: 'application/json',
+          responseSchema: { type: Type.OBJECT, properties: { questions: { type: Type.ARRAY, items: { type: Type.OBJECT, properties: { id:{ type:Type.STRING }, type:{ type:Type.STRING, enum:['multiple','trueFalse','shortAnswer'] }, question:{ type:Type.STRING }, options:{ type:Type.ARRAY, items:{ type:Type.STRING } }, answer:{ type:Type.STRING }, explanation:{ type:Type.STRING }, relatedConcepts:{ type:Type.ARRAY, items:{ type:Type.STRING } } }, required:['type','question','answer','explanation'] } } }, required:['questions'] },
+          thinkingConfig: { thinkingBudget: 0 }
+        }
+      });
+      return safeParseJSON(response.text);
+    };
+
+    const maxRetries = 2;
+    let result; let lastErr;
+    for (let i=0;i<=maxRetries;i++) {
+      try { result = await attempt(); if (result) break; }
+      catch(e){ lastErr=e; if (!/UNAVAILABLE|503|timeout|unavailable/i.test(e.message) || i===maxRetries) break; await new Promise(r=>setTimeout(r, 600*Math.pow(2,i)+Math.random()*300)); }
     }
 
-    const response = await ai.models.generateContent({
-      model: process.env.GEMINI_MODEL || 'gemini-2.5-flash-lite',
-      contents: [
-        `基於以下教材內容和關鍵知識點，${difficultyPrompts[difficulty]}，生成${totalCount}道題目：
-
-        教材內容：
-        ${content}
-
-        關鍵知識點：
-        ${JSON.stringify(keyPoints, null, 2)}
-
-        請按照以下題型數量分配生成題目：
-        - 多選題：${counts.multiple}道
-        - 真/假題：${counts.trueFalse}道  
-        - 簡答題：${counts.shortAnswer}道
-
-        返回JSON格式，每道題目包含：
-        - 題目類型 (type: 'multiple', 'trueFalse', 'shortAnswer')
-        - 題目內容 (question)
-        - 選項 (options，僅多選題需要)
-        - 正確答案 (answer)
-        - 解釋說明 (explanation)
-        - 相關知識點 (relatedConcepts)
-
-        注意：
-        1. 嚴格按照指定的題型數量分配
-        2. 多選題提供4個選項，標註正確答案(A/B/C/D)
-        3. 真假題答案為 'true' 或 'false'
-        4. 簡答題提供詳細的標準答案`
-      ],
-      config: {
-        responseMimeType: "application/json",
-        responseSchema: {
-          type: Type.OBJECT,
-          properties: {
-            questions: {
-              type: Type.ARRAY,
-              items: {
-                type: Type.OBJECT,
-                properties: {
-                  id: { type: Type.STRING },
-                  type: { 
-                    type: Type.STRING,
-                    enum: ['multiple', 'trueFalse', 'shortAnswer']
-                  },
-                  question: { type: Type.STRING },
-                  options: {
-                    type: Type.ARRAY,
-                    items: { type: Type.STRING }
-                  },
-                  answer: { type: Type.STRING },
-                  explanation: { type: Type.STRING },
-                  relatedConcepts: {
-                    type: Type.ARRAY,
-                    items: { type: Type.STRING }
-                  }
-                }
-              }
-            }
-          }
-        },
-        thinkingConfig: {
-          thinkingBudget: 0
-        }
+    const detectPlaceholders = (r) => !r || !Array.isArray(r.questions) || r.questions.some(q => {
+      if (!q || !q.question) return true;
+      if (q.type==='multiple') {
+        if (!Array.isArray(q.options) || q.options.length!==4) return true;
+        if (q.options.some(o=>isPlaceholder(o))) return true;
       }
+      if (isPlaceholder(q.question) || isPlaceholder(q.explanation||'') || isPlaceholder(q.answer||'')) return true;
+      return false;
     });
 
-    const result = JSON.parse(response.text);
-    
-    // 後端補全與正規化：若模型回傳題目缺欄位，使用 keyPoints/summary 自動補齊，避免前端無法顯示
+    if (result && detectPlaceholders(result)) {
+      try {
+        const badPieces = result.questions.filter(q=>q && q.options).slice(0,3).map(q => q.options.join('/')).join(' || ');
+        let refined = await attempt(badPieces);
+        if (refined && detectPlaceholders(refined)) {
+          refined = await attempt('仍出現疑似模板/佔位詞，請改寫並提供多樣化語言');
+        }
+        if (!detectPlaceholders(refined)) result = refined; else console.log('精煉後仍有疑似佔位，進入本地修復');
+      } catch(refErr) { console.log('精煉重試失敗，進入本地修復'); }
+    }
+
+    // ---------- 極限挽救解析（若有原始文本但 result 為空） ----------
+    if (!result) {
+      // 不馬上 fallback，再嘗試一次最小指令
+      try {
+        const minimal = await ai.models.generateContent({
+          model: process.env.GEMINI_MODEL || 'gemini-2.5-flash-lite',
+            contents:[`只輸出 JSON：{"questions":[...]}，生成 ${totalCount} 題（多選${counts.multiple} 真偽${counts.trueFalse} 簡答${counts.shortAnswer}）。每題含 question, type, answer, explanation, options(若為 multiple)。教材片段：\n${content.slice(0,1200)}`],
+          config:{ responseMimeType:'application/json', thinkingConfig:{ thinkingBudget:0 } }
+        });
+        result = safeParseJSON(minimal.text);
+      } catch(e) { /* ignore */ }
+    }
+
+    // 若仍完全失敗 -> fallback（不顯示『降級』文案）
+    if (!result || !Array.isArray(result.questions)) {
+      const topics = keyPoints?.topics || []; const facts = keyPoints?.facts || [];
+      const fb = []; const take = (arr,i,fallback)=> arr.length? arr[i%arr.length]: fallback;
+      for (let i=0;i<counts.multiple;i++) { const stem = take(topics,i,`主題${i+1}`); const fact = (take(facts,i,stem)).slice(0,50); fb.push({ id:`fb_m_${i}`, type:'multiple', question:`關於「${stem}」下列何者最正確？`, options:[fact, `${stem} 的常見誤解敘述`, `${stem} 與無關概念混合的錯誤`, `將 ${stem} 因果倒置的說法`], answer:'A', explanation:`A 對應教材核心；其餘為誤解類型（泛化 / 混淆 / 錯誤因果）。`, relatedConcepts:[stem] }); }
+      for (let i=0;i<counts.trueFalse;i++){ const txt = take(facts,i,take(topics,i,`敘述${i+1}`)); fb.push({ id:`fb_t_${i}`, type:'trueFalse', question:`「${txt}」此敘述是否為真？`, answer:'true', explanation:'可由教材原文佐證為真；若與原文矛盾則判為 false。', relatedConcepts:[txt] }); }
+      for (let i=0;i<counts.shortAnswer;i++){ const stem = take(topics,i,take(facts,i,`概念${i+1}`)); fb.push({ id:`fb_s_${i}`, type:'shortAnswer', question:`說明「${stem}」核心意涵並舉一應用。`, answer:`請根據教材說明 ${stem} 的定義、特徵與應用。`, explanation:'參考方向：定義 + 關鍵機制/特徵 + 應用示例。', relatedConcepts:[stem] }); }
+      result = { questions: fb, degraded:true };
+    }
+
+    // -------- 本地修復 / 強化後處理（保留原來邏輯） --------
     const topics = Array.isArray(keyPoints?.topics) ? keyPoints.topics : [];
+    const facts = Array.isArray(keyPoints?.facts) ? keyPoints.facts : [];
     const conceptsArr = Array.isArray(keyPoints?.concepts) ? keyPoints.concepts : [];
     const conceptNames = conceptsArr.map(c => c?.name).filter(Boolean);
-    const conceptDescMap = new Map();
-    conceptsArr.forEach(c => conceptDescMap.set(c?.name, c?.description || ''));
-    const facts = Array.isArray(keyPoints?.facts) ? keyPoints.facts : [];
+    const conceptDescMap = new Map(); conceptsArr.forEach(c=>conceptDescMap.set(c.name, c.description||''));
     const summary = typeof keyPoints?.summary === 'string' ? keyPoints.summary : '';
-    const pick = (arr, i, fallback = '') => (Array.isArray(arr) && arr.length > 0 ? arr[i % arr.length] : fallback);
+    const pick = (arr,i,fallback='') => (Array.isArray(arr)&&arr.length? arr[i%arr.length]: fallback);
 
-    result.questions = (Array.isArray(result.questions) ? result.questions : []).map((q, index) => {
-      const nowId = `q_${Date.now()}_${index}`;
-      const type = q?.type || 'multiple';
-      let question = q?.question;
-      let options = Array.isArray(q?.options) ? q.options : [];
-      let answer = q?.answer;
-      let explanation = q?.explanation || '';
-      let relatedConcepts = Array.isArray(q?.relatedConcepts) ? q.relatedConcepts : [];
-
-      if (type === 'multiple') {
-        if (!question) {
-          const topic = pick(topics, index, '本章主題');
-          question = `關於「${topic}」，以下哪一項敘述較為恰當？（系統自動補全）`;
-        }
-        if (options.length < 4) {
-          const base = pick(facts, index, '依教材可知的正確敘述');
-          options = [String(base), '與教材不符的敘述 A', '與教材不符的敘述 B', '與教材不符的敘述 C'];
-        }
-        if (!answer || typeof answer !== 'string') {
-          answer = 'A';
-        }
-      } else if (type === 'trueFalse') {
-        if (!question) {
-          const fact = pick(facts, index, pick(topics, index, '此敘述'));
-          question = `「${fact}」此敘述是否正確？（系統自動補全）`;
-        }
-        if (!answer || typeof answer !== 'string') {
-          answer = 'true';
-        }
-      } else if (type === 'shortAnswer') {
-        if (!question) {
-          const cname = pick(conceptNames, index, pick(topics, index, '本章重點'));
-          question = `請簡述「${cname}」的重點。（系統自動補全）`;
-        }
-        if (!answer || typeof answer !== 'string' || answer.trim() === '') {
-          const cname = pick(conceptNames, index, '');
-          const desc = cname ? (conceptDescMap.get(cname) || '') : '';
-          answer = (desc || summary || '請根據教材內容作答。').toString().slice(0, 300);
-        }
-      }
-
-      if (!explanation) {
-        explanation = '本題內容由系統自動補全，建議重新生成題目以獲得更精確的敘述。';
-      }
-      if (relatedConcepts.length === 0 && conceptNames.length > 0) {
-        relatedConcepts = [pick(conceptNames, index)];
-      }
-
-      return {
-        id: q?.id || nowId,
-        type,
-        question,
-        options,
-        answer,
-        explanation,
-        relatedConcepts
+    const buildDistractors = (base, pool) => {
+      const uniq = Array.from(new Set(pool.filter(x=>x && x!==base))).slice(0,12);
+      const out = [];
+      const mutate = (s,mode) => {
+        if (!s) return ''; let t=s;
+        if (mode===0) t = t.replace(/是|為|可以/g,'可能');
+        else if (mode===1) t = '將 ' + t.replace(/的/g,'') + ' 與其他概念混淆的說法';
+        else if (mode===2) t = '錯誤地認為 ' + t + ' 可直接產生另一結果';
+        return t.slice(0,60);
       };
-    });
-    
-    // 為每個題目添加唯一ID（若缺失）
-    result.questions.forEach((question, index) => {
-      question.id = question.id || `q_${Date.now()}_${index}`;
+      for (let i=0;i<3;i++) out.push(mutate(uniq[i]||base,i));
+      return out.map((d,i)=> d || `常見誤解${i+1}`);
+    };
+
+    let repairedCount = 0;
+    result.questions = (result.questions||[]).map((q,idx)=>{
+      const type = q?.type || 'multiple';
+      let question = (q?.question||'').trim();
+      let options = Array.isArray(q?.options)? q.options.slice(0,4):[];
+      let answer = (q?.answer||'').trim();
+      let explanation = (q?.explanation||'').trim();
+      let relatedConcepts = Array.isArray(q?.relatedConcepts)? q.relatedConcepts.filter(Boolean).slice(0,3):[];
+
+      if (type==='multiple') {
+        if (!question || isPlaceholder(question)) {
+          question = `下列何者最能正確說明「${pick(topics,idx,'核心概念')}」？`;
+          repairedCount++;
+        }
+        const baseConcept = pick(facts,idx,pick(topics,idx,'教材重點')).slice(0,70) || '教材重點概念';
+        if (options.length!==4 || options.some(o=>isPlaceholder(o))) {
+          const distractPool = facts.concat(topics).concat(conceptNames).filter(Boolean);
+          const distractors = buildDistractors(baseConcept, distractPool);
+          options = [baseConcept, ...distractors].slice(0,4);
+          answer = 'A';
+          repairedCount++;
+        }
+        if (!/^[ABCD]$/i.test(answer)) { answer='A'; repairedCount++; }
+      } else if (type==='trueFalse') {
+        if (!question || /是否正確$/.test(question) || isPlaceholder(question)) {
+          const fact = pick(facts,idx,pick(topics,idx,'該概念要點'));
+          question = `「${fact.slice(0,70)}」此敘述是否為真？`;
+          repairedCount++;
+        }
+        if (!/^(true|false)$/i.test(answer)) { answer='true'; repairedCount++; }
+      } else if (type==='shortAnswer') {
+        if (!question) { const c = pick(conceptNames,idx,pick(topics,idx,'本章重點')); question = `說明「${c}」的核心原理並舉一應用情境。`; repairedCount++; }
+        if (!answer || answer.length<20) {
+          const c = pick(conceptNames,idx,'該概念');
+          const desc = conceptDescMap.get(c)|| summary || '請根據教材內容作答。';
+          answer = desc.slice(0,160);
+          repairedCount++;
+        }
+      }
+
+      if (!relatedConcepts.length) {
+        const c1 = pick(conceptNames,idx,pick(topics,idx,''));
+        if (c1) relatedConcepts=[c1];
+      }
+
+      const lowExp = !explanation || explanation.length<30 || isPlaceholder(explanation);
+      if (lowExp) {
+        if (type==='multiple') {
+          const other = ['B','C','D'].map((k,i)=> `${k}：對應常見誤解類型${i+1}` ).join('；');
+          explanation = `答案 ${answer || 'A'} 為教材核心表述；${other}（語意扭曲 / 混淆 / 錯誤因果）。`;
+        } else if (type==='trueFalse') {
+          explanation = `依教材原文或已知事實判定真偽；若與教材陳述一致則為 true，否則為 false。`;
+        } else {
+          explanation = `完整作答應涵蓋定義、機制/特徵與實際應用示例三部分。`;
+        }
+        repairedCount++;
+      }
+
+      return { id: q.id || `q_${Date.now()}_${idx}`, type, question, options: type==='multiple'? options: [], answer, explanation, relatedConcepts };
     });
 
+    if (repairedCount>0) result.repaired = repairedCount;
     return result;
   } catch (error) {
     throw new Error(`題目生成失败: ${error.message}`);
@@ -351,71 +376,78 @@ async function evaluateAnswers(questions, userAnswers) {
     let totalScore = 0;
     const weakAreas = [];
 
-    for (let i = 0; i < questions.length; i++) {
-      const question = questions[i];
-      const userAnswer = userAnswers[i];
-      
-      let isCorrect = false;
-      let score = 0;
-      let feedback = '';
-
-      if (question.type === 'multiple' || question.type === 'trueFalse') {
-        console.log(`問題 ${i + 1}:`);
-        console.log(`用戶答案: "${userAnswer}"`);
-        console.log(`正確答案: "${question.answer}"`);
-        console.log(`用戶答案(小寫): "${userAnswer?.toLowerCase()}"`);
-        console.log(`正確答案(小寫): "${question.answer?.toLowerCase()}"`);
-        
-        isCorrect = userAnswer && question.answer && 
-                   userAnswer.toLowerCase().trim() === question.answer.toLowerCase().trim();
-        score = isCorrect ? 100 : 0;
-        feedback = isCorrect ? '答案正確！' : `答案錯誤。正確答案是：${question.answer}`;
-        
-        console.log(`是否正確: ${isCorrect}`);
-        console.log('---');
-      } else if (question.type === 'shortAnswer') {
-        // 使用 AI 評估簡答題
+    // 簡答題評估 helper：含重試與 fallback
+    const evaluateShortAnswer = async (question, userAnswerRaw) => {
+      const userAnswer = (userAnswerRaw || '').toString().trim();
+      const stdAnswer = (question.answer || '').toString().trim();
+      const attempt = async () => {
         const evalResponse = await ai.models.generateContent({
           model: process.env.GEMINI_MODEL || 'gemini-2.5-flash-lite',
           contents: [
-            `請評估以下簡答題的答案：
-
-            題目：${question.question}
-            標準答案：${question.answer}
-            學生答案：${userAnswer}
-
-            請給出：
-            1. 分數 (0-100)
-            2. 是否正確 (true/false)
-            3. 具體反饋
-
-            以JSON格式返回`
+            `請評估以下簡答題答案，僅回傳 JSON：\n\n題目：${question.question}\n標準答案：${stdAnswer}\n學生答案：${userAnswer}\n\n請給出：\n1. score (0-100)\n2. isCorrect (true/false)\n3. feedback (中文具體建議)\n\nJSON 格式：{ "score":數字, "isCorrect":布林, "feedback":"文字" }`
           ],
           config: {
-            responseMimeType: "application/json",
-            responseSchema: {
-              type: Type.OBJECT,
-              properties: {
-                score: { type: Type.INTEGER },
-                isCorrect: { type: Type.BOOLEAN },
-                feedback: { type: Type.STRING }
-              }
-            },
-            thinkingConfig: {
-              thinkingBudget: 0
-            }
+            responseMimeType: 'application/json',
+            responseSchema: { type: Type.OBJECT, properties: { score:{ type:Type.INTEGER }, isCorrect:{ type:Type.BOOLEAN }, feedback:{ type:Type.STRING } } },
+            thinkingConfig: { thinkingBudget: 0 }
           }
         });
+        return JSON.parse(evalResponse.text);
+      };
+      const maxRetries = 2; let result; let lastErr;
+      for (let i=0;i<=maxRetries;i++) {
+        try { result = await attempt(); break; }
+        catch(e){
+          lastErr = e;
+          if (!/UNAVAILABLE|503|timeout|unavailable/i.test(e.message) || i===maxRetries) break;
+          const delay = 500 * Math.pow(2,i) + Math.random()*300;
+            await new Promise(r=>setTimeout(r, delay));
+        }
+      }
+      if (result && typeof result.score === 'number') return result; // 成功
 
-        const evalResult = JSON.parse(evalResponse.text);
-        score = evalResult.score;
-        isCorrect = evalResult.isCorrect;
-        feedback = evalResult.feedback;
+      // Fallback 關鍵詞重疊評估
+      const tokenRegex = /[A-Za-z0-9\u4e00-\u9fa5]+/g;
+      const stdTokens = (stdAnswer.match(tokenRegex) || []).map(t=>t.toLowerCase());
+      const userTokens = (userAnswer.match(tokenRegex) || []).map(t=>t.toLowerCase());
+      const uniqStd = Array.from(new Set(stdTokens));
+      const userSet = new Set(userTokens);
+      let hit = 0; const missed = [];
+      uniqStd.forEach(w=>{ if (userSet.has(w)) hit++; else missed.push(w); });
+      const ratio = uniqStd.length? hit / uniqStd.length : 0;
+      const score = Math.round(ratio * 100);
+      const isCorrect = score >= 70; // 門檻可調整
+      let feedback;
+      if (!userAnswer) {
+        feedback = '未提供答案，請根據教材內容回答關鍵要點。';
+      } else if (isCorrect) {
+        feedback = missed.length ? `整體答對度高，但可補充：${missed.slice(0,6).join('、')}` : '答案涵蓋主要要點。';
+      } else {
+        feedback = missed.length ? `尚未涵蓋主要要點：${missed.slice(0,6).join('、')}。建議重讀教材相關段落。` : '答案與標準重疊度低，建議重新整理概念。';
+      }
+      return { score, isCorrect, feedback, degraded: true };
+    };
+
+    for (let i = 0; i < questions.length; i++) {
+      const question = questions[i];
+      const userAnswer = userAnswers[i];
+      let isCorrect = false; let score = 0; let feedback = ''; let degraded = false;
+
+      if (question.type === 'multiple' || question.type === 'trueFalse') {
+        isCorrect = userAnswer && question.answer && userAnswer.toLowerCase().trim() === question.answer.toLowerCase().trim();
+        score = isCorrect ? 100 : 0;
+        feedback = isCorrect ? '答案正確！' : `答案錯誤。正確答案是：${question.answer}`;
+      } else if (question.type === 'shortAnswer') {
+        try {
+          const evalRes = await evaluateShortAnswer(question, userAnswer);
+          score = evalRes.score; isCorrect = !!evalRes.isCorrect; feedback = evalRes.feedback; degraded = evalRes.degraded;
+        } catch(e) {
+          // 最終兜底：完全失敗
+          score = 0; isCorrect = false; feedback = '評估服務暫時不可用，請稍後再試。'; degraded = true;
+        }
       }
 
-      if (!isCorrect || score < 70) {
-        weakAreas.push(...question.relatedConcepts);
-      }
+      if (!isCorrect || score < 70) weakAreas.push(...(question.relatedConcepts || []));
 
       results.push({
         questionId: question.id,
@@ -424,23 +456,15 @@ async function evaluateAnswers(questions, userAnswers) {
         isCorrect,
         score,
         feedback,
-        explanation: question.explanation
+        explanation: question.explanation,
+        degraded
       });
-
       totalScore += score;
     }
 
-    const averageScore = totalScore / questions.length;
-    
-    // 生成學習建議
+    const averageScore = results.length? totalScore / results.length : 0;
     const recommendations = await generateRecommendations(averageScore, weakAreas);
-
-    return {
-      results,
-      totalScore: Math.round(averageScore),
-      weakAreas: [...new Set(weakAreas)],
-      recommendations
-    };
+    return { results, totalScore: Math.round(averageScore), weakAreas: [...new Set(weakAreas)], recommendations };
   } catch (error) {
     throw new Error(`答案評估失败: ${error.message}`);
   }

@@ -1,27 +1,42 @@
-version: '3.9'
 services:
   server:
-    build: ./server
+    build: 
+      context: ./server
+      dockerfile: Dockerfile
     container_name: ai_learn_server
     env_file: .env
+    environment:
+      - HOST=0.0.0.0
+      - PORT=3000
     ports:
       - "3000:3000"
     volumes:
-      - ./server/uploads:/app/server/uploads
+      - ./server/uploads:/app/uploads
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:3000/api/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
     networks:
       - ai_learn_net
+
   frontend:
-    build: ./app
+    build:
+      context: .
+      dockerfile: app/Dockerfile
+      args:
+        VUE_APP_API_BASE_URL: http://server:3000
     container_name: ai_learn_frontend
-    env_file: .env
-    environment:
-      - VUE_APP_API_BASE_URL=http://server:3000
     ports:
-      - "8080:8080"
+      - "8080:80"
     depends_on:
-      - server
+      server:
+        condition: service_healthy
+    restart: unless-stopped
     networks:
       - ai_learn_net
+
 networks:
   ai_learn_net:
     driver: bridge
