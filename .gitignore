@@ -1,0 +1,15 @@
+# Root gitignore
+node_modules
+**/node_modules
+.dist
+dist
+server/uploads
+.env
+.env.*
+*.log
+yarn-error.log
+# Docker artifacts
+*.pid
+# OS
+.DS_Store
+Thumbs.db

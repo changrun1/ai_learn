@@ -1,0 +1,29 @@
+{
+  "name": "ai-learning-platform",
+  "version": "1.0.0",
+  "description": "智能學習平台",
+  "private": true,
+  "workspaces": [
+    "server",
+    "app"
+  ],
+  "scripts": {
+    "dev": "concurrently \"yarn workspace server dev\" \"yarn workspace app serve\"",
+    "start": "concurrently \"yarn workspace server start\" \"yarn workspace app serve\"",
+    "build": "yarn workspace app build",
+    "server:dev": "yarn workspace server dev",
+    "server:start": "yarn workspace server start",
+    "app:serve": "yarn workspace app serve",
+    "app:build": "yarn workspace app build",
+    "install:all": "yarn install",
+    "clean": "yarn workspace server clean && yarn workspace app clean",
+    "env:check": "node -e \"require('dotenv').config(); console.log('配置檢查:', { HOST: process.env.SERVER_HOST, PORT: process.env.SERVER_PORT, API_URL: process.env.API_BASE_URL });\""
+  },
+  "devDependencies": {
+    "concurrently": "^8.2.2"
+  },
+  "engines": {
+    "node": ">=16.0.0",
+    "yarn": ">=1.22.0"
+  }
+}
