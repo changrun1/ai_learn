@@ -44,3 +44,4 @@
 
 - **前端**: http://localhost:8080 (本地) 或 http://123.194.35.219:8080 (外部)
 - **後端 API**: http://localhost:3000 (本地) 或 http://123.194.35.219:3000 (外部)
+- **反向代理**: Docker 佈署時可直接透過 http://localhost:8080/api/* 存取 API，伺服器會透過 Nginx 轉發到後端服務。
